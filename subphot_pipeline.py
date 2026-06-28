@@ -888,3 +888,255 @@ def process_epoch(sci_path, ref: Frame, ref_fwhm, ref_sky, ref_std,
 def _aperture_mask(shape, x, y, r):
     yy, xx = np.mgrid[0:shape[0], 0:shape[1]]
     return (xx - x) ** 2 + (yy - y) ** 2 <= r ** 2
+
+
+
+
+
+
+# Parallel execution
+
+_THREAD_ENV = ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
+               "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS")
+
+_WCAT = None
+_WCFG = None
+
+
+def _init_worker(cat, cfg):
+    global _WCAT, _WCFG
+    _WCAT, _WCFG = cat, cfg
+    for v in _THREAD_ENV:
+        os.environ.setdefault(v, "1")
+
+
+def _process_one(task):
+    sci_path, ref_path, ref_fwhm, ref_sky, ref_std, band = task
+    try:
+        ref = load_frame(ref_path, _WCFG)
+        res = process_epoch(sci_path, ref, ref_fwhm, ref_sky, ref_std,
+                            _WCAT, band, _WCFG)
+        return res if res else {"_skip": os.path.basename(sci_path)}
+    except Exception as exc:
+        import traceback
+        return {"_error": f"{os.path.basename(sci_path)}: {exc}",
+                "_tb": traceback.format_exc()}
+
+
+def _write_ref_fits(ref: Frame, path: str) -> str:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    hdr = ref.wcs.to_header()
+    hdr["EXPTIME"] = ref.exptime
+    hdr["GAIN"] = ref.gain
+    hdr["RDNOISE"] = ref.rdnoise
+    hdr["SATURATE"] = ref.saturate
+    hdr["FILTER"] = ref.band
+    fits.writeto(path, np.asarray(ref.data, np.float32), hdr, overwrite=True)
+    return path
+
+
+# Main
+
+def main(argv=None):
+    p = argparse.ArgumentParser(description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--sci", required=True,
+                   help="folder of science images (any band) -- or a glob")
+    p.add_argument("--ref", required=True,
+                   help="folder of reference images (one per band) -- or a file")
+    p.add_argument("--ra", type=float, required=True, help="SN RA (deg)")
+    p.add_argument("--dec", type=float, required=True, help="SN Dec (deg)")
+    p.add_argument("--outdir", default="out")
+    p.add_argument("--hotpants", default="hotpants")
+    p.add_argument("--bands", default=None,
+                   help="comma-list to restrict processing, e.g. 'g,r,i'")
+    p.add_argument("--cal-max-stars", type=int, default=200,
+                   help="max calibrators (default 200; one fast GSPC query)")
+    p.add_argument("--cal-gmin", type=float, default=13.0,
+                   help="bright Gaia G cut for calibrators")
+    p.add_argument("--cal-gmax", type=float, default=17.5,
+                   help="faint Gaia G cut (GSPC reliable to ~17.65)")
+    p.add_argument("--cstar-max", type=float, default=0.10,
+                   help="GSPC |C*| quality cut (smaller = cleaner, fewer stars)")
+    p.add_argument("--use-gaiaxpy", action="store_true",
+                   help="integrate BP/RP spectra with GaiaXPy instead of GSPC (slow)")
+    p.add_argument("--cal-radius", type=float, default=0.0,
+                   help="Gaia cone radius in arcmin (0 = auto from frame)")
+    p.add_argument("--gain", type=float, default=None)
+    p.add_argument("--rdnoise", type=float, default=None)
+    p.add_argument("--saturate", type=float, default=None)
+    p.add_argument("--saturate-frac", type=float, default=0.90,
+                   help="HOTPANTS upper data limit as a fraction of saturation")
+    p.add_argument("--kernel-order", type=int, default=2,
+                   help="HOTPANTS spatial kernel order (-ko)")
+    p.add_argument("--no-flatten-bkg", action="store_true",
+                   help="disable large-scale background flattening")
+    p.add_argument("--bkg-box", type=int, default=128,
+                   help="Background2D mesh size in px (keep LARGE for hosts)")
+    p.add_argument("--bkg-order", type=int, default=1,
+                   help="HOTPANTS spatial background order (-bgo)")
+    p.add_argument("--sn-color", type=float, default=None,
+                   help="SN colour (this band's pair) for colour-term correction")
+    p.add_argument("--no-color-term", action="store_true")
+    p.add_argument("--nsigma-limit", type=float, default=5.0)
+    p.add_argument("--ncpu", type=int, default=1,
+                   help="parallel workers over epochs (default 1 = serial)")
+    p.add_argument("--no-cutouts", action="store_true",
+                   help="disable the per-epoch sci/ref/diff triptych")
+    p.add_argument("--plots", action="store_true")
+    args = p.parse_args(argv)
+
+    def gather(path):
+        if os.path.isdir(path):
+            files = []
+            for ext in ("*.fits", "*.fits.fz", "*.fz", "*.fit"):
+                files += glob.glob(os.path.join(path, ext))
+            return sorted(files)
+        return sorted(glob.glob(path))
+
+    sci_files = gather(args.sci)
+    if not sci_files:
+        log("No science files matched."); sys.exit(1)
+
+    cfg = Config(
+        sci_glob=args.sci, ref_path=args.ref, ra=args.ra, dec=args.dec,
+        outdir=args.outdir, hotpants=args.hotpants,
+        gain=args.gain, rdnoise=args.rdnoise, saturate=args.saturate,
+        saturate_frac=args.saturate_frac, kernel_order=args.kernel_order,
+        flatten_bkg=not args.no_flatten_bkg, bkg_box=args.bkg_box,
+        bkg_order=args.bkg_order, cal_max_stars=args.cal_max_stars,
+        cal_radius_arcmin=args.cal_radius, cal_gmin=args.cal_gmin,
+        cal_gmax=args.cal_gmax, cstar_max=args.cstar_max,
+        use_gaiaxpy=args.use_gaiaxpy,
+        fit_color_term=not args.no_color_term, sn_color=args.sn_color,
+        nsigma_limit=args.nsigma_limit, plots=args.plots,
+        ncpu=max(1, args.ncpu), cutouts=not args.no_cutouts,
+    )
+    os.makedirs(cfg.outdir, exist_ok=True)
+
+    only = {b.strip() for b in args.bands.split(",")} if args.bands else None
+    sci_by_band: dict[str, list] = {}
+    for f in sci_files:
+        b, raw = peek_band(f)
+        if b is None:
+            log(f"skip (unknown filter {raw!r}): {os.path.basename(f)}"); continue
+        if only and b not in only:
+            continue
+        sci_by_band.setdefault(b, []).append(f)
+    if not sci_by_band:
+        log("No science frames with a recognised, requested band."); sys.exit(1)
+    log("Science bands: " + ", ".join(f"{b}({len(v)})"
+                                      for b, v in sci_by_band.items()))
+
+    ref_by_band: dict[str, str] = {}
+    if os.path.isdir(args.ref):
+        for rf in gather(args.ref):
+            rb, _ = peek_band(rf)
+            if rb and rb not in ref_by_band:
+                ref_by_band[rb] = rf
+    else:
+        rb, _ = peek_band(args.ref)
+        ref_by_band[rb if rb else "_single"] = args.ref
+    log("Reference bands: " + (", ".join(ref_by_band) or "none"))
+
+    # --- build the Gaia synthetic calibration catalogue ONCE ---
+    sn = SkyCoord(cfg.ra * u.deg, cfg.dec * u.deg)
+    if cfg.cal_radius_arcmin > 0:
+        radius = cfg.cal_radius_arcmin
+    else:
+        probe = load_frame(sci_files[0], cfg)
+        ny, nx = probe.data.shape
+        corners = probe.wcs.pixel_to_world([0, nx - 1, 0, nx - 1],
+                                           [0, 0, ny - 1, ny - 1])
+        radius = float(np.max(sn.separation(corners).arcmin)) + 1.0
+    log("Building Gaia DR3 XP synthetic catalogue once for the whole run ...")
+    cat = build_calibration_catalog(sn, radius, list(sci_by_band.keys()), cfg)
+    if len(cat) == 0:
+        log("WARNING: empty calibration catalogue; magnitudes will be NaN.")
+
+
+    refs_dir = os.path.join(cfg.outdir, "_refs")
+    ref_cache = {}
+    for band in sci_by_band:
+        ref_src = ref_by_band.get(band) or ref_by_band.get("_single")
+        if ref_src is None:
+            log(f"No reference for band '{band}' -> skipping "
+                f"{len(sci_by_band[band])} frames.")
+            continue
+        log(f"--- band {band}: reference {os.path.basename(ref_src)} ---")
+        ref = load_frame(ref_src, cfg)
+        if cfg.flatten_bkg:
+            rf0, _, _, _ = measure_fwhm_bkg(ref.data)
+            ref.data, struct = flatten_background(ref.data, cfg.bkg_box,
+                                                  cfg.bkg_filter, rf0)
+            log(f"flattened reference background (structure rms={struct:.2f})")
+        ref_fwhm, ref_sky, ref_std, _ = measure_fwhm_bkg(ref.data)
+        ref.band = band
+        ref_flat = _write_ref_fits(ref, os.path.join(refs_dir, f"ref_{band}.fits"))
+        ref_cache[band] = (ref_flat, ref_fwhm, ref_sky, ref_std)
+        log(f"reference FWHM={ref_fwhm:.2f} px")
+
+    tasks = []
+    for band, files in sci_by_band.items():
+        if band not in ref_cache:
+            continue
+        rp, rf, rs, rstd = ref_cache[band]
+        for f in files:
+            tasks.append((f, rp, rf, rs, rstd, band))
+    if not tasks:
+        log("No epochs to process (missing references?)."); return
+
+    rows = []
+
+    def _handle(res):
+        if not res or "_skip" in res:
+            return
+        if "_error" in res:
+            log("FAILED " + res["_error"])
+            print(res.get("_tb", ""), file=sys.stderr)
+            return
+        rows.append(res)
+        b, m = res["band"], res["mag_ap"]
+        if np.isfinite(m):
+            tag = "DET" if res["detected"] else f"<{cfg.nsigma_limit:.0f}sig"
+            log(f"  done {res['frame']}: {b}={m:.3f}+/-{res['mag_ap_err']:.3f} "
+                f"[{tag}] ZP={res['zp']:.3f} n_cal={res['n_cal']}")
+        else:
+            log(f"  done {res['frame']}: {b}>{res['limit_mag']:.2f} "
+                f"({cfg.nsigma_limit:.0f}sigma limit)")
+
+    if cfg.ncpu > 1 and len(tasks) > 1:
+        for v in _THREAD_ENV:
+            os.environ.setdefault(v, "1")
+        nproc = min(cfg.ncpu, len(tasks))
+        log(f"Processing {len(tasks)} epochs on {nproc} workers ...")
+        ctx = mp.get_context("spawn")
+        with ProcessPoolExecutor(max_workers=nproc, mp_context=ctx,
+                                 initializer=_init_worker,
+                                 initargs=(cat, cfg)) as ex:
+            futures = [ex.submit(_process_one, t) for t in tasks]
+            for fut in as_completed(futures):
+                _handle(fut.result())
+    else:
+        log(f"Processing {len(tasks)} epochs serially ...")
+        _init_worker(cat, cfg)
+        for t in tasks:
+            _handle(_process_one(t))
+
+    if rows:
+        tbl = Table(rows)
+        tbl.sort(["band", "mjd"])
+        out_csv = os.path.join(cfg.outdir, "lightcurve.csv")
+        tbl.write(out_csv, format="csv", overwrite=True)
+        for band in sorted(set(tbl["band"])):
+            sub = tbl[tbl["band"] == band]
+            sub.write(os.path.join(cfg.outdir, f"lightcurve_{band}.csv"),
+                      format="csv", overwrite=True)
+        log(f"Light curve written: {out_csv}  "
+            f"({len(tbl)} epochs across {len(set(tbl['band']))} band(s))")
+    else:
+        log("No epochs produced output.")
+
+
+if __name__ == "__main__":
+    main()
