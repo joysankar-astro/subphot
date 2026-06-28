@@ -380,3 +380,511 @@ def run_hotpants(sci_path: str, ref_path: str, out_diff: str, out_noise: str,
                 "path. Try:  export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH")
         return False
     return convolve_template
+
+
+def build_epsf(data: np.ndarray, sky: float, fwhm: float, satur: float):
+    from photutils.detection import DAOStarFinder
+    from photutils.psf import EPSFBuilder, extract_stars
+
+    _, med, std = sigma_clipped_stats(data, sigma=3)
+    finder = DAOStarFinder(fwhm=fwhm, threshold=20 * std, exclude_border=True)
+    src = finder(data - med)
+    if src is None or len(src) < 5:
+        return None
+
+    size = int(np.ceil(fwhm * 5)) | 1  # odd cutout size
+    half = size // 2
+    ny, nx = data.shape
+
+    # keep bright, non-saturated, well-separated stars
+    src = src[(src["peak"] < 0.85 * satur)]
+    src.sort("flux"); src.reverse()
+    xc, yc = _xy_cols(src)
+    keep = []
+    xs, ys = np.asarray(src[xc]), np.asarray(src[yc])
+    for i, row in enumerate(src):
+        x, y = float(row[xc]), float(row[yc])
+        if x < half or y < half or x > nx - half or y > ny - half:
+            continue
+        d = np.hypot(xs - x, ys - y)
+        if np.sum(d < 2 * size) > 1:   # crowded -> skip
+            continue
+        keep.append((x, y))
+        if len(keep) >= 25:
+            break
+    if len(keep) < 5:
+        return None
+
+    stars_tbl = Table()
+    stars_tbl["x"] = [k[0] for k in keep]
+    stars_tbl["y"] = [k[1] for k in keep]
+    nd = NDData(data=data - med)
+    try:
+        stars = extract_stars(nd, stars_tbl, size=size)
+        builder = EPSFBuilder(oversampling=2, maxiters=8,
+                              progress_bar=False, smoothing_kernel="quartic")
+        epsf, _ = builder(stars)
+        return epsf
+    except Exception as exc:
+        log(f"ePSF build failed: {exc}")
+        return None
+
+
+def aperture_photometry_at(data, err, positions, r, r_in, r_out):
+    from photutils.aperture import (CircularAperture, CircularAnnulus,
+                                     ApertureStats, aperture_photometry)
+    positions = np.atleast_2d(positions)
+    ap = CircularAperture(positions, r=r)
+    ann = CircularAnnulus(positions, r_in=r_in, r_out=r_out)
+    sky = ApertureStats(data, ann, sigma_clip=SigmaClip(sigma=3))
+    phot = aperture_photometry(data, ap, error=err)
+    bkg_per_pix = sky.median
+    phot["aper_bkg"] = bkg_per_pix * ap.area
+    phot["flux"] = phot["aperture_sum"] - phot["aper_bkg"]
+    phot["flux_err"] = phot["aperture_sum_err"]
+    return phot
+
+def curve_of_growth_apcor(data, err, fwhm, sky, std, satur,
+                          r_small, r_big, r_in, r_out):
+    from photutils.detection import DAOStarFinder
+    finder = DAOStarFinder(fwhm=fwhm, threshold=30 * std, exclude_border=True)
+    src = finder(data - sky)
+    if src is None or len(src) < 3:
+        return 0.0, 0.05
+    src = src[src["peak"] < 0.8 * satur]
+    src.sort("flux"); src.reverse()
+    src = src[: min(30, len(src))]
+    xc, yc = _xy_cols(src)
+    pos = np.transpose([np.asarray(src[xc]), np.asarray(src[yc])])
+    small = aperture_photometry_at(data, err, pos, r_small, r_in, r_out)
+    big = aperture_photometry_at(data, err, pos, r_big, r_in, r_out)
+    good = (small["flux"] > 0) & (big["flux"] > 0)
+    if good.sum() < 3:
+        return 0.0, 0.05
+    dmag = -2.5 * np.log10(small["flux"][good] / big["flux"][good])
+    dmag = sigma_clip(dmag, sigma=3, maxiters=3)
+    return float(np.ma.median(dmag)), float(np.ma.std(dmag))
+
+def psf_forced_phot(data, err, epsf, x, y, fit_shape=7):
+    if epsf is None:
+        return np.nan, np.nan
+    from photutils.psf import PSFPhotometry
+    try:
+        model = epsf.copy()
+        # forced photometry: freeze the centroid, fit only the flux
+        model.x_0.fixed = True
+        model.y_0.fixed = True
+        psfphot = PSFPhotometry(model, fit_shape=(fit_shape, fit_shape),
+                                aperture_radius=fit_shape)
+        init = Table({"x_0": [x], "y_0": [y]})
+        out = psfphot(data, error=err, init_params=init)
+        flux = float(out["flux_fit"][0])
+        ferr = float(out["flux_err"][0]) if "flux_err" in out.colnames else np.nan
+        return flux, ferr
+    except Exception as exc:
+        log(f"PSF photometry failed: {exc}")
+        return np.nan, np.nan
+    
+# Gaia DR3 synthetic photometry calibration catalogue (built ONCE per run)
+
+def _gspc_columns(band: str):
+    """(mag, flux, flux_error) column names in synthetic_photometry_gspc."""
+    if band in "ugriz":
+        return (f"{band}_sdss_mag", f"{band}_sdss_flux", f"{band}_sdss_flux_error")
+    if band in _JOHNSON:
+        b = band.lower()
+        return (f"{b}_jkc_mag", f"{b}_jkc_flux", f"{b}_jkc_flux_error")
+    return None
+
+
+def build_catalog_gspc(center: SkyCoord, radius_arcmin: float, bands, cfg: Config):
+    from astroquery.gaia import Gaia
+
+    systems = sorted({BAND_SYSTEM[b] for b in bands if b in BAND_SYSTEM})
+    if not systems:
+        log(f"No supported calibration system for bands {sorted(set(bands))}.")
+        return Table()
+
+    # request every band of each needed system (gives colour-pair partners too)
+    sel_bands = []
+    for system in systems:
+        sel_bands += SYSTEM_BANDS[system]
+    phot_cols = []
+    for b in sel_bands:
+        phot_cols += [f"s.{c}" for c in _gspc_columns(b)]
+
+    gmax = min(cfg.cal_gmax, 17.65)   # GSPC is undefined fainter than this
+    Gaia.ROW_LIMIT = -1
+    adql = f"""
+        SELECT TOP {int(cfg.cal_max_stars)}
+               g.source_id, g.ra, g.dec, g.pmra, g.pmdec, g.ref_epoch,
+               g.phot_g_mean_mag, s.c_star,
+               {', '.join(phot_cols)}
+        FROM gaiadr3.gaia_source AS g
+        JOIN gaiadr3.synthetic_photometry_gspc AS s ON g.source_id = s.source_id
+        WHERE 1 = CONTAINS(POINT('ICRS', g.ra, g.dec),
+                           CIRCLE('ICRS', {center.ra.deg}, {center.dec.deg},
+                                  {radius_arcmin / 60.0}))
+          AND g.phot_g_mean_mag BETWEEN {cfg.cal_gmin} AND {gmax}
+          AND ABS(s.c_star) < {cfg.cstar_max}
+        ORDER BY g.random_index
+    """
+    log(f"Querying GSPC synthetic photometry (r={radius_arcmin:.1f}', "
+        f"G={cfg.cal_gmin}-{gmax}, |C*|<{cfg.cstar_max}, systems={systems}) ...")
+    gaia = Gaia.launch_job_async(adql).get_results()
+    if len(gaia) == 0:
+        log("No GSPC calibrators in field; try a looser --cstar-max or fainter "
+            "--cal-gmax, or --use-gaiaxpy.")
+        return Table()
+    log(f"  {len(gaia)} GSPC calibrators (no spectra fetched)")
+
+    cols = {c.lower(): c for c in gaia.colnames}
+    cat = Table()
+    cat["source_id"] = gaia["source_id"]
+    cat["ra"] = gaia["ra"]
+    cat["dec"] = gaia["dec"]
+    for c in ("pmra", "pmdec"):
+        col = gaia[c]
+        cat[c] = col.filled(0.0) if hasattr(col, "filled") else col
+    cat["ref_epoch"] = gaia["ref_epoch"]
+
+    for b in sel_bands:
+        mcol, fcol, ecol = _gspc_columns(b)
+        mname = cols.get(mcol.lower())
+        if mname is None:
+            continue
+        mag = np.asarray(gaia[mname], dtype=float)
+        magerr = np.full(len(cat), 0.02)
+        fname, ename = cols.get(fcol.lower()), cols.get(ecol.lower())
+        if fname and ename:
+            f_ = np.asarray(gaia[fname], dtype=float)
+            e_ = np.asarray(gaia[ename], dtype=float)
+            with np.errstate(divide="ignore", invalid="ignore"):
+                magerr = np.where(f_ > 0, 1.0857 * e_ / f_, 0.02)
+        cat[f"mag_{b}"] = mag
+        cat[f"magerr_{b}"] = magerr
+    return cat
+
+def build_catalog_gaiaxpy(center: SkyCoord, radius_arcmin: float, bands, cfg: Config):
+    """
+    Fallback: takes long time
+    """
+    from astroquery.gaia import Gaia
+    from gaiaxpy import generate, PhotometricSystem
+
+    systems = sorted({BAND_SYSTEM[b] for b in bands if b in BAND_SYSTEM})
+    if not systems:
+        return Table()
+
+    Gaia.ROW_LIMIT = -1
+    adql = f"""
+        SELECT TOP {int(cfg.cal_max_stars)}
+               source_id, ra, dec, pmra, pmdec, ref_epoch, phot_g_mean_mag
+        FROM gaiadr3.gaia_source
+        WHERE has_xp_continuous = 'true'
+          AND phot_g_mean_mag BETWEEN {cfg.cal_gmin} AND {cfg.cal_gmax}
+          AND 1 = CONTAINS(POINT('ICRS', ra, dec),
+                           CIRCLE('ICRS', {center.ra.deg}, {center.dec.deg},
+                                  {radius_arcmin / 60.0}))
+        ORDER BY random_index
+    """
+    log(f"Querying Gaia XP-continuous sources (GaiaXPy path, r={radius_arcmin:.1f}') ...")
+    gaia = Gaia.launch_job_async(adql).get_results()
+    if len(gaia) == 0:
+        return Table()
+    log(f"  {len(gaia)} sources -> integrating spectra with GaiaXPy (slow, once)")
+
+    phot_systems = [getattr(PhotometricSystem, s) for s in systems]
+    src_ids = list(np.asarray(gaia["source_id"], dtype=np.int64))
+    synth = generate(src_ids, photometric_system=phot_systems, save_file=False)
+    synth = Table.from_pandas(synth) if not isinstance(synth, Table) else synth
+    cols = {c.lower(): c for c in synth.colnames}
+    smap = {int(s): i for i, s in enumerate(synth["source_id"])}
+
+    cat = Table()
+    cat["source_id"] = gaia["source_id"]
+    cat["ra"] = gaia["ra"]; cat["dec"] = gaia["dec"]
+    for c in ("pmra", "pmdec"):
+        col = gaia[c]
+        cat[c] = col.filled(0.0) if hasattr(col, "filled") else col
+    cat["ref_epoch"] = gaia["ref_epoch"]
+
+    idx = np.array([smap.get(int(s), -1) for s in cat["source_id"]])
+    for system in systems:
+        label = SYSTEM_LABEL.get(system, system.capitalize())
+        for b in SYSTEM_BANDS[system]:
+            mcol = cols.get(f"{label}_mag_{b}".lower())
+            fcol = cols.get(f"{label}_flux_{b}".lower())
+            ecol = cols.get(f"{label}_flux_error_{b}".lower())
+            if mcol is None:
+                continue
+            mag = np.full(len(cat), np.nan); magerr = np.full(len(cat), 0.02)
+            for k, j in enumerate(idx):
+                if j < 0:
+                    continue
+                mag[k] = float(synth[mcol][j])
+                if fcol and ecol and synth[fcol][j]:
+                    magerr[k] = float(1.0857 * synth[ecol][j] / synth[fcol][j])
+            cat[f"mag_{b}"] = mag
+            cat[f"magerr_{b}"] = magerr
+    return cat
+
+def build_calibration_catalog(center: SkyCoord, radius_arcmin: float,
+                              bands, cfg: Config):
+    """Dispatch to the fast GSPC query (default) or GaiaXPy spectra (fallback)."""
+    if cfg.use_gaiaxpy:
+        return build_catalog_gaiaxpy(center, radius_arcmin, bands, cfg)
+    return build_catalog_gspc(center, radius_arcmin, bands, cfg)
+
+
+def propagate_pm(cal: Table, obs_mjd: float) -> SkyCoord:
+    ref_epoch = float(np.nanmedian(cal["ref_epoch"]))
+    c = SkyCoord(ra=np.asarray(cal["ra"]) * u.deg,
+                 dec=np.asarray(cal["dec"]) * u.deg,
+                 pm_ra_cosdec=np.nan_to_num(np.asarray(cal["pmra"])) * u.mas / u.yr,
+                 pm_dec=np.nan_to_num(np.asarray(cal["pmdec"])) * u.mas / u.yr,
+                 obstime=Time(ref_epoch, format="jyear"))
+    try:
+        return c.apply_space_motion(new_obstime=Time(obs_mjd, format="mjd"))
+    except Exception:
+        return c  # if PM/epoch missing, use catalogue positions
+
+# Zeropoint solution
+def solve_zeropoint(sci: Frame, fwhm, sky, std, cat: Table, apcor,
+                    band: str, cfg: Config):
+    """
+    Measure instrumental mags of Gaia calibrators on the science frame and fit
+        mag_synth(band) = m_inst + ZP + k * colour
+    where colour is the band's canonical colour pair (e.g. g-r for g/r). The
+    synthetic mags come from the pre-built catalogue (no GaiaXPy call here).
+    Returns dict with zp, zp_err, color_term, n_stars, rms.
+    """
+    magcol = f"mag_{band}"
+    if magcol not in cat.colnames:
+        log(f"No synthetic {band}-band magnitudes in catalogue.")
+        return None
+
+    err = make_error_map(sci.data, sky, std, sci.gain)
+    r = cfg.aper_fwhm * fwhm
+    r_in, r_out = cfg.sky_in_fwhm * fwhm, cfg.sky_out_fwhm * fwhm
+
+    coords = propagate_pm(cat, sci.mjd)
+    x, y = sci.wcs.world_to_pixel(coords)
+    ny, nx = sci.data.shape
+    inside = (x > r_out) & (y > r_out) & (x < nx - r_out) & (y < ny - r_out)
+    inside &= np.isfinite(np.asarray(cat[magcol]))
+    sub = cat[inside]; x = x[inside]; y = y[inside]
+    if len(sub) < 3:
+        return None
+
+    pos = np.transpose([x, y])
+    phot = aperture_photometry_at(sci.data, err, pos, r, r_in, r_out)
+    flux = np.asarray(phot["flux"]); ferr = np.asarray(phot["flux_err"])
+    good = (flux > 0) & (flux / np.maximum(ferr, 1e-9) > 20)
+    if good.sum() < 3:
+        return None
+
+    m_inst = -2.5 * np.log10(flux[good]) + apcor
+    mag_syn = np.asarray(sub[magcol])[good]
+    mag_err = np.asarray(sub[f"magerr_{band}"])[good] if f"magerr_{band}" in sub.colnames \
+        else np.full(good.sum(), 0.02)
+
+    blue, red = COLOR_PAIR.get(band, (band, band))
+    if f"mag_{blue}" in sub.colnames and f"mag_{red}" in sub.colnames:
+        color = (np.asarray(sub[f"mag_{blue}"]) - np.asarray(sub[f"mag_{red}"]))[good]
+        color = np.nan_to_num(color, nan=np.nanmedian(color))
+        have_color = True
+    else:
+        color = np.zeros(good.sum()); have_color = False
+
+    m_err = 1.0857 * ferr[good] / flux[good]
+    w = 1.0 / np.sqrt(mag_err**2 + m_err**2 + 0.01**2)
+    delta = mag_syn - m_inst  # = ZP + k*colour
+
+    if cfg.fit_color_term and have_color and good.sum() >= 6:
+        A = np.vstack([np.ones_like(color), color]).T
+        for _ in range(3):                 # sigma-clipped weighted LSQ
+            sol, *_ = np.linalg.lstsq(A * w[:, None], delta * w, rcond=None)
+            resid = delta - A @ sol
+            keep = np.abs(resid - np.median(resid)) < 3 * (np.std(resid) + 1e-9)
+            A, delta, color, w = A[keep], delta[keep], color[keep], w[keep]
+            if keep.all():
+                break
+        zp, k = float(sol[0]), float(sol[1])
+        rms = float(np.std(delta - A @ sol)); n = len(delta)
+    else:
+        clipped = sigma_clip(delta, sigma=3, maxiters=5)
+        zp = float(np.ma.average(clipped, weights=w[~clipped.mask]))
+        k = 0.0
+        rms = float(np.ma.std(clipped)); n = int(clipped.count())
+
+    zp_err = rms / np.sqrt(max(n, 1))
+    return dict(zp=zp, zp_err=zp_err, color_term=k, n_stars=n, rms=rms,
+                color_pair=f"{blue}-{red}" if have_color else "none")
+
+
+def make_error_map(data, sky, std, gain):
+    from photutils.utils import calc_total_error
+    bkg_err = np.full_like(data, std, dtype=np.float64)
+    src = np.clip(data - sky, 0, None)
+    return calc_total_error(src, bkg_err, effective_gain=max(gain, 1e-3))
+
+def save_cutouts(sci, ref_aligned, diff, x, y, out_png, box=45,
+                 aper_r=None, title=None):
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        from matplotlib.patches import Circle
+        from astropy.visualization import ZScaleInterval
+    except Exception:
+        return
+    zs = ZScaleInterval()
+    xi, yi = int(round(x)), int(round(y))
+    ny, nx = sci.shape
+    y0, y1 = max(yi - box, 0), min(yi + box, ny)
+    x0, x1 = max(xi - box, 0), min(xi + box, nx)
+    sl = (slice(y0, y1), slice(x0, x1))
+    cx, cy = x - x0, y - y0                       # SN position within the cutout
+
+    fig, axes = plt.subplots(1, 3, figsize=(11.5, 4.2))
+    panels = [(sci, "science"), (ref_aligned, "reference"), (diff, "difference")]
+    for ax, (im, label) in zip(axes, panels):
+        cut = np.asarray(im[sl], dtype=float)
+        lo, hi = zs.get_limits(cut[np.isfinite(cut)] if np.isfinite(cut).any() else cut)
+        ax.imshow(cut, vmin=lo, vmax=hi, cmap="gray", origin="lower")
+        if aper_r:
+            ax.add_patch(Circle((cx, cy), aper_r, ec="red", fc="none", lw=1.2))
+        else:
+            ax.plot(cx, cy, "r+", ms=14, mew=1.4)
+        ax.set_title(label, fontsize=11)
+        ax.set_xticks([]); ax.set_yticks([])
+    if title:
+        fig.suptitle(title, fontsize=10)
+    fig.tight_layout(rect=(0, 0, 1, 0.95 if title else 1))
+    fig.savefig(out_png, dpi=120)
+    plt.close(fig)
+
+
+
+
+def process_epoch(sci_path, ref: Frame, ref_fwhm, ref_sky, ref_std,
+                  cat, band, cfg: Config):
+    sci = load_frame(sci_path, cfg)
+    log(f"=== {sci.name}  band={sci.band}->{band}  EXPTIME={sci.exptime:.1f}s "
+        f"MJD={sci.mjd:.4f} ===")
+
+    if cfg.flatten_bkg:
+        sci_fwhm0, _, _, _ = measure_fwhm_bkg(sci.data)
+        sci.data, struct = flatten_background(
+            sci.data, cfg.bkg_box, cfg.bkg_filter, sci_fwhm0)
+        log(f"flattened science background (removed structure rms={struct:.2f})")
+
+    sci_fwhm, sci_sky, sci_std, _ = measure_fwhm_bkg(sci.data)
+    log(f"science FWHM={sci_fwhm:.2f} px  sky={sci_sky:.1f}  rms={sci_std:.1f}")
+
+    workdir = os.path.join(cfg.outdir, sci.name)
+    os.makedirs(workdir, exist_ok=True)
+
+    ref_aligned_path = os.path.join(workdir, "ref_aligned.fits")
+    reproject_reference(ref, sci, ref_aligned_path)
+    sci_plain = write_plain_fits(sci, os.path.join(workdir, "sci.fits"))
+    ref_aligned = load_frame(ref_aligned_path, cfg)
+
+    diff_path = os.path.join(workdir, "diff.fits")
+    noise_path = os.path.join(workdir, "diff.noise.fits")
+    conv_tmpl = run_hotpants(sci_plain, ref_aligned_path, diff_path, noise_path,
+                             sci, ref_aligned, sci_fwhm, ref_fwhm, cfg)
+    if conv_tmpl is False and not os.path.exists(diff_path):
+        return None
+
+    diff = fits.getdata(diff_path).astype(np.float64)
+    diff_noise = (fits.getdata(noise_path).astype(np.float64)
+                  if os.path.exists(noise_path)
+                  else make_error_map(diff, 0.0, sci_std, sci.gain))
+    diff_noise = np.where(np.isfinite(diff_noise) & (diff_noise > 0),
+                          diff_noise, np.nanmedian(diff_noise))
+
+    if conv_tmpl:
+        epsf = build_epsf(sci.data, sci_sky, sci_fwhm, sci.saturate)
+        psf_fwhm = sci_fwhm
+    else:
+        epsf = build_epsf(ref_aligned.data, ref_sky, ref_fwhm, ref.saturate)
+        psf_fwhm = ref_fwhm
+
+    sn = SkyCoord(cfg.ra * u.deg, cfg.dec * u.deg)
+    xsn, ysn = sci.wcs.world_to_pixel(sn)
+    xsn, ysn = float(xsn), float(ysn)
+
+    r = cfg.aper_fwhm * sci_fwhm
+    r_in, r_out = cfg.sky_in_fwhm * sci_fwhm, cfg.sky_out_fwhm * sci_fwhm
+    apcor, apcor_err = curve_of_growth_apcor(
+        sci.data, make_error_map(sci.data, sci_sky, sci_std, sci.gain),
+        sci_fwhm, sci_sky, sci_std, sci.saturate,
+        r, cfg.big_aper_fwhm * sci_fwhm, r_in, r_out)
+
+    ap = aperture_photometry_at(diff, diff_noise, [xsn, ysn], r, r_in, r_out)
+    flux_ap = float(ap["flux"][0]); ferr_ap = float(ap["flux_err"][0])
+    flux_psf, ferr_psf = psf_forced_phot(diff, diff_noise, epsf, xsn, ysn,
+                                         fit_shape=int(np.ceil(psf_fwhm * 1.5)) | 1)
+
+    zp = solve_zeropoint(sci, sci_fwhm, sci_sky, sci_std, cat, apcor, band, cfg)
+    if zp is None:
+        log("WARNING: zeropoint failed (too few calibrators).")
+        zp = dict(zp=np.nan, zp_err=np.nan, color_term=0.0, n_stars=0,
+                  rms=np.nan, color_pair="none")
+
+    def calibrate(flux, ferr):
+        if not np.isfinite(flux) or flux <= 0:
+            return np.nan, np.nan
+        m_inst = -2.5 * np.log10(flux) + apcor
+        m = m_inst + zp["zp"]
+        if cfg.fit_color_term and cfg.sn_color is not None:
+            m += zp["color_term"] * cfg.sn_color
+        merr = np.sqrt((1.0857 * ferr / flux) ** 2 + zp["zp_err"] ** 2
+                       + apcor_err ** 2)
+        return m, merr
+
+    mag_ap, mag_ap_err = calibrate(flux_ap, ferr_ap)
+    mag_psf, mag_psf_err = calibrate(flux_psf, ferr_psf)
+
+
+    noise_in_ap = float(np.sqrt(np.sum(
+        diff_noise[_aperture_mask(diff.shape, xsn, ysn, r)] ** 2)))
+    lim_flux = cfg.nsigma_limit * noise_in_ap
+    limmag = (-2.5 * np.log10(lim_flux) + apcor + zp["zp"]
+              if np.isfinite(zp["zp"]) and lim_flux > 0 else np.nan)
+
+    snr_ap = flux_ap / ferr_ap if ferr_ap and ferr_ap > 0 else np.nan
+    detected = np.isfinite(snr_ap) and snr_ap >= cfg.nsigma_limit
+
+    if cfg.cutouts or cfg.plots:
+        if np.isfinite(mag_ap):
+            sub = f"{band}={mag_ap:.2f}+/-{mag_ap_err:.2f}  SNR={snr_ap:.1f}"
+        else:
+            sub = f"{band}>{limmag:.2f} ({cfg.nsigma_limit:.0f}sigma limit)"
+        title = (f"{sci.name}   MJD={sci.mjd:.3f}   "
+                 f"FWHM={sci_fwhm:.1f}px   {sub}")
+        save_cutouts(sci.data, ref_aligned.data, diff, xsn, ysn,
+                     os.path.join(workdir, f"{sci.name}_sci_ref_diff.png"),
+                     aper_r=r, title=title)
+
+    return dict(
+        frame=sci.name, band=band, raw_filter=sci.band, mjd=sci.mjd,
+        exptime=sci.exptime, fwhm_pix=sci_fwhm,
+        zp=zp["zp"], zp_err=zp["zp_err"], color_term=zp["color_term"],
+        color_pair=zp.get("color_pair", "none"),
+        n_cal=zp["n_stars"], zp_rms=zp["rms"],
+        x_sn=xsn, y_sn=ysn, apcor=apcor,
+        flux_ap=flux_ap, flux_ap_err=ferr_ap, snr_ap=snr_ap,
+        mag_ap=mag_ap, mag_ap_err=mag_ap_err,
+        flux_psf=flux_psf, flux_psf_err=ferr_psf,
+        mag_psf=mag_psf, mag_psf_err=mag_psf_err,
+        detected=bool(detected),
+        limit_mag=limmag, nsigma=cfg.nsigma_limit,
+    )
+
+
+def _aperture_mask(shape, x, y, r):
+    yy, xx = np.mgrid[0:shape[0], 0:shape[1]]
+    return (xx - x) ** 2 + (yy - y) ** 2 <= r ** 2
